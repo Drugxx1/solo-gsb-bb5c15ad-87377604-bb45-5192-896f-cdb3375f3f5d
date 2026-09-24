@@ -626,13 +626,15 @@ def create_checkpoint(
     """Capture a consumer checkpoint at the current published-stream position.
 
     The position (number of published readings and the last reading's
-    deterministic-order keyset) and the session's published watermark are
-    recorded together in one serialised write transaction, i.e. one read
-    snapshot.  Checkpoint names are unique within a session: re-creating the
-    same name at the same position is idempotent (200, the original snapshot is
-    returned unchanged); creating it once the stream has moved to a different
-    position returns 409.  Later publishes and session closure never mutate a
-    checkpoint.
+    deterministic-order keyset), the session's published watermark and its
+    monotonic publish marker are recorded together in one serialised write
+    transaction, i.e. one read snapshot.  Checkpoint names are unique within
+    a session: re-creating the same name while no reading has been published
+    since is idempotent (200, the original snapshot is returned unchanged) --
+    even if retention has deleted the covered rows in the meantime; creating
+    it once readings have been published since returns 409, even if those
+    rows were cleaned up later.  Later publishes and session closure never
+    mutate a checkpoint.
     """
     result, created = checkpoints.create_checkpoint(conn, session_id, body.name)
     return JSONResponse(

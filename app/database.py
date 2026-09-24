@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import Request
 
@@ -310,11 +311,144 @@ CREATE TABLE retention_tombstones (
     )
 
 
+def _migration_5(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Monotonic publish marker for retention-proof checkpoint idempotency.
+
+    Checkpoint idempotency used to compare the checkpoint's captured stream
+    position (published-row count + last keyset) against the *current*
+    published rows.  Once retention deleted the rows a checkpoint had already
+    covered, the recomputed position no longer matched and a same-name retry
+    was wrongly rejected with 409 even though nothing new had been published.
+
+    This migration adds a per-session marker ``sessions.published_seq`` that
+    counts every reading ever published: it is only ever incremented, inside
+    the same serialised transaction that flips the readings to published, and
+    retention never writes it.  Each checkpoint row records the marker value
+    at creation (``checkpoints.published_seq``), so a same-name retry is
+    idempotent exactly when the marker has not advanced -- independent of
+    which rows retention has since removed, and a 409 exactly when readings
+    were published in between, even if those rows were cleaned up later.
+
+    Backfill for existing databases (checkpoints and their resume boundaries
+    are preserved, never rewritten): a session's marker starts at its current
+    published-row count N.  Readings published after a checkpoint's creation
+    carry keysets strictly greater than every checkpoint's captured keyset,
+    so retention can never have deleted them while any checkpoint exists --
+    "nothing was published after this checkpoint" is exactly "its captured
+    keyset is at or beyond the current stream frontier" (or the stream is
+    empty).  Such a checkpoint shares the session marker N and its retry
+    stays idempotent -- even when retention already removed the rows it
+    covered, which is precisely the false 409 this marker fixes.  Every other
+    checkpoint (behind the frontier, or an empty-stream checkpoint on a now
+    non-empty stream) gets a strictly smaller marker, so its retry keeps
+    correctly conflicting with 409.
+    """
+    _add_column_if_missing(
+        conn,
+        "sessions",
+        "published_seq",
+        "published_seq INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "checkpoints",
+        "published_seq",
+        "published_seq INTEGER NOT NULL DEFAULT 0",
+    )
+
+    for session in conn.execute("SELECT session_id FROM sessions").fetchall():
+        sid = session["session_id"]
+        stream_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM readings"
+            " WHERE session_id = ? AND status = 'published'",
+            (sid,),
+        ).fetchone()["c"]
+        frontier = conn.execute(
+            "SELECT observed_at, source_id, seq FROM readings"
+            " WHERE session_id = ? AND status = 'published'"
+            " ORDER BY observed_at DESC, source_id DESC, seq DESC LIMIT 1",
+            (sid,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE sessions SET published_seq = ? WHERE session_id = ?",
+            (stream_count, sid),
+        )
+        checkpoints = conn.execute(
+            "SELECT name, last_observed_at, last_source_id, last_seq"
+            " FROM checkpoints WHERE session_id = ?",
+            (sid,),
+        ).fetchall()
+        for checkpoint in checkpoints:
+            marker = _backfill_checkpoint_marker(
+                conn, sid, checkpoint, frontier, stream_count
+            )
+            conn.execute(
+                "UPDATE checkpoints SET published_seq = ?"
+                " WHERE session_id = ? AND name = ?",
+                (marker, sid, checkpoint["name"]),
+            )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+        (applied_at,),
+    )
+
+
+def _backfill_checkpoint_marker(
+    conn: sqlite3.Connection,
+    session_id: str,
+    checkpoint: sqlite3.Row,
+    frontier: Optional[sqlite3.Row],
+    stream_count: int,
+) -> int:
+    """Publish-marker value assigned to a pre-v5 checkpoint by migration 5.
+
+    ``frontier`` is the last published row currently in the stream (``None``
+    when nothing is published); ``stream_count`` is the session's backfilled
+    marker.  A checkpoint at or beyond the frontier (or on an empty stream)
+    had nothing published after it and shares the session marker; any other
+    checkpoint gets a strictly smaller value so its same-name retry keeps
+    returning 409 exactly as before the upgrade.
+    """
+    key = (
+        checkpoint["last_observed_at"],
+        checkpoint["last_source_id"],
+        checkpoint["last_seq"],
+    )
+    if stream_count == 0 or (
+        key[0] is not None
+        and key >= (frontier["observed_at"], frontier["source_id"], frontier["seq"])
+    ):
+        # Empty stream, or nothing published after this checkpoint (its
+        # covered rows may already be cleaned up): the marker is the
+        # session's, so a same-name retry stays idempotent.
+        return stream_count
+    if key[0] is None:
+        # Empty-stream checkpoint on a now non-empty stream: every extant
+        # row was necessarily published after it.
+        return 0
+    # The frontier advanced beyond the captured keyset: readings were
+    # published after this checkpoint.  The count of extant rows at or
+    # before the keyset is strictly below the session marker (the frontier
+    # row itself is never counted).
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM readings"
+        " WHERE session_id = ? AND status = 'published'"
+        " AND (observed_at < ?"
+        " OR (observed_at = ? AND source_id < ?)"
+        " OR (observed_at = ? AND source_id = ? AND seq <= ?))",
+        (
+            session_id,
+            key[0], key[0], key[1], key[0], key[1], key[2],
+        ),
+    ).fetchone()["c"]
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
+    5: _migration_5,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

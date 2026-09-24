@@ -31,6 +31,11 @@ Guarantees implemented here:
   advances both kinds of alert rules in deterministic merge order, and flips
   the session to ``closed``; afterwards every previously-unseen reading key
   is rejected.
+* Every actual publish (watermark advance or terminal tail flush) increments
+  the session's persistent, monotonically increasing ``published_seq``
+  marker inside the same transaction.  Checkpoints snapshot the marker at
+  creation, so checkpoint idempotency survives retention cleanup of the
+  published rows; retention never writes the marker.
 """
 from __future__ import annotations
 
@@ -166,6 +171,16 @@ def _publish_under_watermark(
         (new_wm, session_id),
     )
     if published_now:
+        # Advance the session's monotonic publish marker in the same
+        # transaction as the publish itself.  Checkpoints snapshot this
+        # marker at creation and compare it on same-name retries; it only
+        # ever grows, so retention deleting the published rows later can
+        # never make an unchanged stream look advanced (or vice versa).
+        conn.execute(
+            "UPDATE sessions SET published_seq = published_seq + ?"
+            " WHERE session_id = ?",
+            (published_now, session_id),
+        )
         # Deterministically-published readings are the *only* input to the
         # per-source alert state machines; buffered readings that merely
         # became published now drive it, in timeline order, inside the same

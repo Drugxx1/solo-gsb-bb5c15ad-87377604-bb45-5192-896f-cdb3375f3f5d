@@ -17,6 +17,7 @@ def client(tmp_path, monkeypatch):
     main.app.state.db_path = db_path
     database.init_db(db_path)
     with TestClient(main.app) as c:
+        c.db_path = db_path  # type: ignore[attr-defined]
         yield c
 
 
@@ -48,6 +49,13 @@ def seal(client, sid, source, final_observed_at):
 
 def make_checkpoint(client, sid, name):
     return client.post(f"/sessions/{sid}/checkpoints", json={"name": name})
+
+
+def retention(client, sid, cutoff, dry_run=False):
+    return client.post(
+        f"/sessions/{sid}/retention",
+        json={"cutoff": cutoff, "dry_run": dry_run},
+    )
 
 
 def keys(rows):
@@ -534,6 +542,315 @@ class TestCheckpointConcurrency:
         assert [c["name"] for c in listed] == ["cp"]
 
 
+class TestCheckpointRetryAfterRetention:
+    """Same-name retries must not be fooled by retention cleanup.
+
+    Idempotency is decided by the session's publish marker, which advances
+    only when readings are actually published.  Retention deleting the rows
+    a checkpoint covered (or any later cleanup) never moves it, so a retry
+    without intervening publishes returns the original checkpoint; a genuine
+    publish in between still conflicts, and the 409 sticks even though the
+    marker can never be moved back by cleanup.
+    """
+
+    def test_retry_after_covered_readings_cleaned_returns_original(self, client):
+        sid = create_session(client, lateness=0.0)
+        # publish a@:00 and b@:10; a@:20 stays buffered on the :20 watermark
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": "2026-01-01T00:00:00Z", "value": 1},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z", "value": 2},
+        ])  # wm :00 -> nothing published (boundary)
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z", "value": 3}])
+        # wm :10 -> a@:00 published
+        report(client, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:30Z", "value": 4}])
+        # wm :20 -> b@:10 published; a@:20 buffered on the boundary
+        first = make_checkpoint(client, sid, "cp")
+        assert first.status_code == 201
+        assert first.json()["stream_offset"] == 2
+
+        # Retention deletes exactly the two rows the checkpoint covered; the
+        # published stream is now empty, so comparing against the current
+        # rows would see a *different* position even though nothing was
+        # published since the checkpoint.
+        deleted = retention(client, sid, "2026-12-31T00:00:00Z").json()
+        assert deleted["deleted"] == 2
+        assert client.get(f"/sessions/{sid}/stream").json()["readings"] == []
+
+        second = make_checkpoint(client, sid, "cp")
+        assert second.status_code == 200
+        # the original checkpoint, with its original creation time
+        assert second.json() == first.json()
+        assert second.json()["created_at"] == first.json()["created_at"]
+        assert second.json()["stream_offset"] == 2
+
+    def test_retry_after_repeated_cleanup_rounds(self, client):
+        sid = create_session(client, lateness=0.0)
+        publish_ladder(client, sid)  # 4 published: a@:00, b@:10, a@:20, b@:30
+        first = make_checkpoint(client, sid, "cp")
+        assert first.status_code == 201
+        assert first.json()["stream_offset"] == 4
+
+        # Two cleanup rounds eventually remove every covered row.
+        assert retention(client, sid, "2026-01-01T00:00:15Z").json()["deleted"] == 2
+        assert retention(client, sid, "2026-12-31T00:00:00Z").json()["deleted"] == 2
+        assert client.get(f"/sessions/{sid}/stream").json()["readings"] == []
+
+        second = make_checkpoint(client, sid, "cp")
+        assert second.status_code == 200
+        assert second.json() == first.json()
+
+    def test_retry_after_cleanup_and_watermark_only_advance(self, client):
+        # Cleanup plus a watermark move that publishes nothing: still an
+        # idempotent retry returning the original watermark snapshot.
+        sid = create_session(client, lateness=10.0)
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": "2026-01-01T00:00:20Z"},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:30Z"},
+        ])  # wm :10, nothing published
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:45Z"},
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:50Z"},
+        ])  # wm :35 -> a@:20 and b@:30 published; a@:45/b@:50 buffered
+        first = make_checkpoint(client, sid, "cp")
+        assert first.status_code == 201
+        assert first.json()["stream_offset"] == 2
+        assert first.json()["published_watermark"] == "2026-01-01T00:00:35Z"
+
+        assert retention(client, sid, "2026-12-31T00:00:00Z").json()["deleted"] == 2
+        assert client.get(f"/sessions/{sid}/stream").json()["readings"] == []
+
+        # The watermark advances to :40 but a@:45 stays beyond it: nothing
+        # new is published, so the retry is still idempotent.
+        report(client, sid, [
+            {"source_id": "a", "seq": 3, "observed_at": "2026-01-01T00:00:55Z"}])
+        state = client.get(f"/sessions/{sid}").json()
+        assert state["published_watermark"] == "2026-01-01T00:00:40Z"
+
+        second = make_checkpoint(client, sid, "cp")
+        assert second.status_code == 200
+        assert second.json() == first.json()
+        assert second.json()["published_watermark"] == "2026-01-01T00:00:35Z"
+
+    def test_conflict_when_published_since_despite_cleanup(self, client):
+        sid = create_session(client, lateness=0.0)
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": "2026-01-01T00:00:00Z"},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z"},
+        ])  # wm :00 -> nothing published (boundary)
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z"}])
+        # wm :10 -> a@:00 published
+        report(client, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:30Z"}])
+        # wm :20 -> b@:10 published; a@:20 buffered on the boundary
+        first = make_checkpoint(client, sid, "cp")
+        assert first.status_code == 201
+        assert first.json()["stream_offset"] == 2
+
+        # Cleanup empties the published stream...
+        assert retention(client, sid, "2026-12-31T00:00:00Z").json()["deleted"] == 2
+        assert client.get(f"/sessions/{sid}/stream").json()["readings"] == []
+        # ...but a genuine publish afterwards still advances the marker.
+        report(client, sid, [
+            {"source_id": "a", "seq": 3, "observed_at": "2026-01-01T00:00:40Z"}])
+        assert keys(full_stream(client, sid)) == [("a", 2)]
+
+        r = make_checkpoint(client, sid, "cp")
+        assert r.status_code == 409
+        # the original checkpoint survives untouched
+        listed = client.get(f"/sessions/{sid}/checkpoints").json()["checkpoints"]
+        assert len(listed) == 1
+        assert listed[0]["stream_offset"] == 2
+        assert listed[0]["created_at"] == first.json()["created_at"]
+
+    def test_retention_never_moves_the_publish_marker(self, client):
+        sid = create_session(client, lateness=0.0)
+        publish_ladder(client, sid)  # 4 published
+        make_checkpoint(client, sid, "cp")
+
+        def markers():
+            conn = sqlite3.connect(client.db_path)
+            try:
+                session_marker = conn.execute(
+                    "SELECT published_seq FROM sessions WHERE session_id = ?",
+                    (sid,),
+                ).fetchone()[0]
+                checkpoint_marker = conn.execute(
+                    "SELECT published_seq FROM checkpoints"
+                    " WHERE session_id = ? AND name = 'cp'",
+                    (sid,),
+                ).fetchone()[0]
+                return session_marker, checkpoint_marker
+            finally:
+                conn.close()
+
+        before = markers()
+        assert before == (4, 4)
+        assert retention(client, sid, "2026-12-31T00:00:00Z").json()["deleted"] == 4
+        assert client.get(f"/sessions/{sid}/stream").json()["readings"] == []
+        # the cleanup removed every published row but neither marker moved
+        assert markers() == before
+        assert make_checkpoint(client, sid, "cp").status_code == 200
+
+
+class TestPublishMarkerMigration:
+    def test_v5_backfills_marker_and_preserves_checkpoints(
+        self, tmp_path, monkeypatch
+    ):
+        from app import database
+        from app.database import utc_now
+        from app.time_utils import store_event_time
+
+        # A database as a v4-era release would have left it: base schema plus
+        # migrations 1-4 applied and recorded, live session data, checkpoints
+        # without the publish marker.
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(database.SCHEMA_V0)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            now = store_event_time(utc_now())
+            for version in (1, 2, 3, 4):
+                database.MIGRATIONS[version](conn, now)
+            conn.execute(
+                "INSERT INTO sessions (session_id, source_ids,"
+                " allowed_lateness_seconds, published_watermark, created_at)"
+                " VALUES (?, ?, 0, ?, ?)",
+                ("legacy-s", '["a","b"]', "2026-01-01T00:00:30.000000Z", now),
+            )
+            for src in ("a", "b"):
+                conn.execute(
+                    "INSERT INTO session_sources (session_id, source_id,"
+                    " max_observed_at, first_seen_at) VALUES (?, ?, ?, ?)",
+                    ("legacy-s", src, "2026-01-01T00:00:30.000000Z", now),
+                )
+            # four published readings: a@:00/1, b@:10/1, a@:20/2, b@:30/2
+            for src, seq, ts in (
+                ("a", 1, "2026-01-01T00:00:00.000000Z"),
+                ("b", 1, "2026-01-01T00:00:10.000000Z"),
+                ("a", 2, "2026-01-01T00:00:20.000000Z"),
+                ("b", 2, "2026-01-01T00:00:30.000000Z"),
+            ):
+                conn.execute(
+                    "INSERT INTO readings (session_id, source_id, seq,"
+                    " observed_at, payload, status, first_received_at,"
+                    " published_watermark) VALUES (?, ?, ?, ?, ?, 'published',"
+                    " ?, ?)",
+                    ("legacy-s", src, seq, ts, str(seq), now,
+                     "2026-01-01T00:00:30.000000Z"),
+                )
+            # checkpoints: one behind the frontier, one at it, one empty-stream
+            for name, offset, ts, src, seq in (
+                ("cp-behind", 2, "2026-01-01T00:00:10.000000Z", "b", 1),
+                ("cp-frontier", 4, "2026-01-01T00:00:30.000000Z", "b", 2),
+                ("cp-empty", 0, None, None, None),
+            ):
+                conn.execute(
+                    "INSERT INTO checkpoints (session_id, name, created_at,"
+                    " stream_offset, last_observed_at, last_source_id, last_seq,"
+                    " published_watermark) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("legacy-s", name, now, offset, ts, src, seq,
+                     "2026-01-01T00:00:30.000000Z"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Startup upgrade applies exactly the pending migration and backfills
+        # the marker without touching the captured positions.
+        database.init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            versions = [r[0] for r in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version")]
+            assert versions == [1, 2, 3, 4, 5]
+            assert database.LATEST_VERSION == 5
+            session_marker = conn.execute(
+                "SELECT published_seq FROM sessions WHERE session_id = 'legacy-s'"
+            ).fetchone()[0]
+            assert session_marker == 4
+            markers = dict(conn.execute(
+                "SELECT name, published_seq FROM checkpoints"
+                " WHERE session_id = 'legacy-s'").fetchall())
+            # at the frontier: shares the session marker -> retry idempotent
+            assert markers["cp-frontier"] == 4
+            # behind the frontier: strictly smaller -> retry keeps 409
+            assert markers["cp-behind"] == 2
+            # empty-stream checkpoint on a non-empty stream: also smaller
+            assert markers["cp-empty"] == 0
+            # captured positions (resume boundaries) are untouched
+            positions = {
+                row[0]: (row[1], row[2], row[3], row[4])
+                for row in conn.execute(
+                    "SELECT name, stream_offset, last_observed_at,"
+                    " last_source_id, last_seq FROM checkpoints"
+                    " WHERE session_id = 'legacy-s'")
+            }
+            assert positions["cp-behind"] == (
+                2, "2026-01-01T00:00:10.000000Z", "b", 1)
+            assert positions["cp-frontier"] == (
+                4, "2026-01-01T00:00:30.000000Z", "b", 2)
+            assert positions["cp-empty"] == (0, None, None, None)
+        finally:
+            conn.close()
+
+        # Re-running init must not re-apply v5.
+        database.init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 5"
+            ).fetchone()[0] == 1
+        finally:
+            conn.close()
+
+        # The upgraded database serves checkpoint traffic with the new
+        # semantics end to end.
+        monkeypatch.setenv("SENSOR_DB_PATH", db_path)
+        from app import main
+
+        main.app.state.db_path = db_path
+        with TestClient(main.app) as c:
+            # nothing was published after cp-frontier: idempotent retry
+            first = c.post(
+                "/sessions/legacy-s/checkpoints", json={"name": "cp-frontier"})
+            assert first.status_code == 200
+            assert first.json()["stream_offset"] == 4
+            assert first.json()["last_seq"] == 2
+            # readings were published after the other two: still 409
+            for name in ("cp-behind", "cp-empty"):
+                r = c.post("/sessions/legacy-s/checkpoints", json={"name": name})
+                assert r.status_code == 409
+            # resume boundaries are preserved exactly
+            body = c.get("/sessions/legacy-s/checkpoints/cp-behind/stream").json()
+            assert keys(body["readings"]) == [("a", 2), ("b", 2)]
+            body = c.get("/sessions/legacy-s/checkpoints/cp-empty/stream").json()
+            assert keys(body["readings"]) == [
+                ("a", 1), ("b", 1), ("a", 2), ("b", 2)]
+
+            # Once the earlier checkpoints are gone, cleanup removes the rows
+            # cp-frontier covered; its retry stays idempotent (the fix).
+            assert c.delete(
+                "/sessions/legacy-s/checkpoints/cp-empty").status_code == 204
+            assert c.delete(
+                "/sessions/legacy-s/checkpoints/cp-behind").status_code == 204
+            deleted = c.post(
+                "/sessions/legacy-s/retention",
+                json={"cutoff": "2026-12-31T00:00:00Z", "dry_run": False},
+            ).json()
+            assert deleted["deleted"] == 4
+            assert c.get("/sessions/legacy-s/stream").json()["readings"] == []
+            again = c.post(
+                "/sessions/legacy-s/checkpoints", json={"name": "cp-frontier"})
+            assert again.status_code == 200
+            assert again.json() == first.json()
+
+
 class TestCheckpointMigration:
     def test_v3_applies_to_legacy_database(self, tmp_path, monkeypatch):
         from app import database
@@ -559,7 +876,7 @@ class TestCheckpointMigration:
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2, 3, 4]
+            assert versions == [1, 2, 3, 4, 5]
             names = {
                 r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")
@@ -569,7 +886,7 @@ class TestCheckpointMigration:
             assert cols == {
                 "session_id", "name", "created_at", "stream_offset",
                 "last_observed_at", "last_source_id", "last_seq",
-                "published_watermark",
+                "published_watermark", "published_seq",
             }
         finally:
             conn.close()

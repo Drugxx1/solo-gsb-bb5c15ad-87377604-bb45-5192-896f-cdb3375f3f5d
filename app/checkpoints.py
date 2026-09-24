@@ -7,17 +7,26 @@ that same instant.  The position is the count of published readings
 ``(last_observed_at, last_source_id, last_seq)`` of the last published
 reading -- both are empty/zero before the first publish.
 
-Checkpoint names are unique within a session.  Creating the same name again is
+Checkpoint names are unique within a session.  Whether creating the same
+name again is idempotent is decided by the session's **publish marker**
+(``sessions.published_seq``): a persistent counter that only ever
+increments, by exactly the number of readings published, inside the publish
+transaction itself.  Each checkpoint records the marker value at creation,
+so the decision does not depend on which published rows are still stored:
 
-* **idempotent** (200) when the current stream position is identical to the
-  one originally captured, and
-* a **409 conflict** when the stream has advanced to a different position.
+* **idempotent** (200) when the marker has not advanced since the checkpoint
+  was created -- no reading was published in between, so the retry returns
+  the original checkpoint with its original ``created_at`` and watermark
+  snapshot, *even if retention has since deleted the rows it covered*;
+* a **409 conflict** when readings were published in between -- the marker
+  only ever grows, so this still holds even if those rows were later
+  cleaned up as well.
 
-Checkpoint rows are immutable once written: later ingestion, source seals and
-session closure append to (or freeze) the stream but never rewrite a
-checkpoint.  Resuming from a checkpoint therefore always resumes at exactly
-the stream position captured at creation; only the optional ``cursor`` page
-position moves forward.
+Checkpoint rows are immutable once written: later ingestion, source seals,
+session closure and retention cleanup append to (or shrink) the stream but
+never rewrite a checkpoint.  Resuming from a checkpoint therefore always
+resumes at exactly the stream position captured at creation; only the
+optional ``cursor`` page position moves forward.
 """
 from __future__ import annotations
 
@@ -91,21 +100,6 @@ def _checkpoint_out(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _same_position(
-    row: sqlite3.Row,
-    offset: int,
-    last_observed_at: Optional[str],
-    last_source_id: Optional[str],
-    last_seq: Optional[int],
-) -> bool:
-    return (
-        row["stream_offset"] == offset
-        and row["last_observed_at"] == last_observed_at
-        and row["last_source_id"] == last_source_id
-        and row["last_seq"] == last_seq
-    )
-
-
 # ---------------------------------------------------------------------------
 # create / list / delete
 # ---------------------------------------------------------------------------
@@ -117,48 +111,56 @@ def create_checkpoint(
 ) -> tuple[dict[str, Any], bool]:
     """Create (or idempotently re-create) a stream checkpoint.
 
-    The current stream position and published watermark are read in the same
-    serialised write transaction as the insert, so they are one consistent
-    snapshot.  Returns ``(checkpoint, created)`` -- ``created`` is False for an
-    idempotent retry of a name whose captured position is unchanged.  The
-    stream having advanced to a different position raises 409; existing
-    checkpoints are never rewritten.
+    The current stream position, the session's published watermark and its
+    publish marker are read in the same serialised write transaction as the
+    insert, so they are one consistent snapshot.  Returns ``(checkpoint,
+    created)`` -- ``created`` is False for an idempotent retry of a name
+    whose publish marker is unchanged (no reading was published since, even
+    if retention deleted the covered rows in the meantime).  Readings having
+    been published since raises 409; existing checkpoints are never
+    rewritten.
     """
     created_at = store_event_time(utc_now())
     with transaction(conn):
         _load_session(conn, session_id)
         offset, last_ts, last_src, last_seq = _stream_position(conn, session_id)
-        watermark = conn.execute(
-            "SELECT published_watermark FROM sessions WHERE session_id = ?",
+        session_row = conn.execute(
+            "SELECT published_watermark, published_seq FROM sessions"
+            " WHERE session_id = ?",
             (session_id,),
-        ).fetchone()["published_watermark"]
+        ).fetchone()
+        watermark = session_row["published_watermark"]
+        publish_seq = session_row["published_seq"]
 
         existing = conn.execute(
             "SELECT * FROM checkpoints WHERE session_id = ? AND name = ?",
             (session_id, name),
         ).fetchone()
         if existing is not None:
-            if not _same_position(existing, offset, last_ts, last_src, last_seq):
+            if existing["published_seq"] != publish_seq:
                 raise ConflictError(
                     f"checkpoint {name!r} already exists in session {session_id!r}"
                     f" at stream_offset={existing['stream_offset']}"
                     f" (last_observed_at={existing['last_observed_at']!r},"
                     f" last_source_id={existing['last_source_id']!r},"
-                    f" last_seq={existing['last_seq']}); current position is"
-                    f" stream_offset={offset}"
-                    f" (last_observed_at={last_ts!r}, last_source_id={last_src!r},"
+                    f" last_seq={existing['last_seq']}); readings have been"
+                    f" published since (current stream_offset={offset},"
+                    f" last_observed_at={last_ts!r}, last_source_id={last_src!r},"
                     f" last_seq={last_seq})"
                 )
-            # Same name at the same stream position: idempotent no-op; the
-            # original snapshot (created_at, watermark) is returned unchanged.
+            # The publish marker has not moved: no reading was published
+            # since the checkpoint was created, so this is an idempotent
+            # retry even if retention has deleted the rows it covered.  The
+            # original snapshot (created_at, watermark) is returned
+            # unchanged.
             return _checkpoint_out(existing), False
 
         conn.execute(
             "INSERT INTO checkpoints (session_id, name, created_at, stream_offset,"
-            " last_observed_at, last_source_id, last_seq, published_watermark)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " last_observed_at, last_source_id, last_seq, published_watermark,"
+            " published_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, name, created_at, offset, last_ts, last_src, last_seq,
-             watermark),
+             watermark, publish_seq),
         )
         row = conn.execute(
             "SELECT * FROM checkpoints WHERE session_id = ? AND name = ?",
