@@ -738,8 +738,8 @@ class TestTombstoneMigration:
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2, 3, 4]
-            assert database.LATEST_VERSION == 4
+            assert versions == [1, 2, 3, 4, 5]
+            assert database.LATEST_VERSION == 5
             cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(retention_tombstones)")}
             assert cols == {

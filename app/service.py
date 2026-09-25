@@ -8,7 +8,11 @@ Guarantees implemented here:
   ``min(source max observed_at) - allowed_lateness``. It is monotonic.
 * Buffered readings with ``observed_at`` strictly before the watermark are
   published exactly once, in the deterministic order
-  ``(observed_at, source_id, seq)``.
+  ``(observed_at, source_id, seq)``.  Each actual publish advances the
+  session's persistent monotonic ``publish_marker`` by the number of newly
+  published readings, inside the same serialised write transaction; that
+  marker is the sole authority for same-name checkpoint idempotency and is
+  never moved backwards by retention.
 * A reading arriving with ``observed_at`` strictly before the already
   published watermark can never be (re)published: it is diverted to the
   quarantine table and never mutates history.
@@ -166,6 +170,15 @@ def _publish_under_watermark(
         (new_wm, session_id),
     )
     if published_now:
+        # The durable publish position advances with the actual publish count,
+        # in this same serialised transaction.  It is the only authority for
+        # checkpoint idempotency, so unlike the live row count it must not
+        # move when retention later removes published rows.
+        conn.execute(
+            "UPDATE sessions SET publish_marker = publish_marker + ?"
+            " WHERE session_id = ?",
+            (published_now, session_id),
+        )
         # Deterministically-published readings are the *only* input to the
         # per-source alert state machines; buffered readings that merely
         # became published now drive it, in timeline order, inside the same

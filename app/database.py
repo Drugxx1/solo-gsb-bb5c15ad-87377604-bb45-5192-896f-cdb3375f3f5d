@@ -310,11 +310,77 @@ CREATE TABLE retention_tombstones (
     )
 
 
+def _migration_5(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Persistent monotonic publish marker for checkpoint idempotency.
+
+    Checkpoint creation used to decide idempotent-retry vs 409 by comparing
+    the checkpoint's captured ``(stream_offset, last keyset)`` against the
+    *current* published-stream position.  Retention legitimately removes the
+    rows a checkpoint already covered, so after a cleanup the live position
+    shrinks even though nothing new was ever published: a same-name retry
+    then mismatched the frozen snapshot and failed with 409.
+
+    The durable position marker ``publish_marker`` removes the dependency on
+    which rows happen to be extant:
+
+    * ``sessions.publish_marker`` advances **only** when readings are
+      actually published (by the count newly published), inside the same
+      serialised write transaction as the publish.  The report path and the
+      last-source-seal tail flush both funnel through the one publish
+      routine, so the marker is consistent with every publish.  Retention
+      never changes it -- deleting rows does not move a position backwards.
+    * ``checkpoints.publish_marker`` is the session marker captured in the
+      checkpoint's own create transaction.  A same-name retry is idempotent
+      while the marker is unchanged and conflicts once it has advanced,
+      regardless of later deletes.
+
+    Legacy databases cannot reconstruct the historical total-ever-published
+    at the instant each old checkpoint was created (the rows retention
+    already removed are gone), so the upgrade establishes a common
+    *baseline*: every session and each of its checkpoints receives the
+    number of published rows currently present.  Checkpoint rows -- and
+    therefore every resume boundary (the frozen keyset) and ``created_at``
+    -- are otherwise left untouched.  From the baseline onward only real
+    publishes advance the marker: an unchanged marker means "no publish
+    since the upgrade" (idempotent retry), any publish advances past every
+    legacy checkpoint at once (409 on retry).
+    """
+    _add_column_if_missing(
+        conn,
+        "sessions",
+        "publish_marker",
+        "publish_marker INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "checkpoints",
+        "publish_marker",
+        "publish_marker INTEGER NOT NULL DEFAULT 0",
+    )
+    # Common baseline: the currently visible published count per session.
+    conn.execute(
+        "UPDATE sessions SET publish_marker = ("
+        " SELECT COUNT(*) FROM readings"
+        " WHERE readings.session_id = sessions.session_id"
+        " AND readings.status = 'published')"
+    )
+    conn.execute(
+        "UPDATE checkpoints SET publish_marker = ("
+        " SELECT publish_marker FROM sessions"
+        " WHERE sessions.session_id = checkpoints.session_id)"
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
+    5: _migration_5,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

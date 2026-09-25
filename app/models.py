@@ -529,6 +529,16 @@ class CheckpointOut(StreamPositionOut):
         None,
         description="Session published watermark captured in the same snapshot",
     )
+    publish_marker: int = Field(
+        ...,
+        description=(
+            "The session's persistent monotonic publish position captured at"
+            " creation: it advances only with actual publishes and never moves"
+            " back when retention deletes rows. A same-name retry is idempotent"
+            " while this value is unchanged and conflicts (409) once it has"
+            " advanced."
+        ),
+    )
 
 
 class CheckpointsResponse(BaseModel):

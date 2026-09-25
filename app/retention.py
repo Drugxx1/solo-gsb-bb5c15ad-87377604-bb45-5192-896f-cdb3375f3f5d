@@ -41,9 +41,10 @@ atomic unit: any failure rolls the transaction back unchanged.  Every row
 actually deleted leaves a **tombstone** in ``retention_tombstones`` (key plus
 canonical-payload digest) inside that same transaction, so a later retry of
 the same key keeps its dedup identity instead of looking like a brand-new
-reading.  Retention never writes to ``sessions``, ``session_sources``, the
-alert tables or ``checkpoints`` -- watermarks, alerts and checkpoint
-semantics are unchanged.  Repeating the same request is idempotent: once the
+reading.  Retention never writes to ``sessions`` (including the monotonic
+``publish_marker`` -- deleting rows does not move the durable publish
+position), ``session_sources``, the alert tables or ``checkpoints`` --
+watermarks, the marker, alerts and checkpoint semantics are unchanged.  Repeating the same request is idempotent: once the
 candidates are gone the second call simply reports zero deletable rows.
 """
 from __future__ import annotations

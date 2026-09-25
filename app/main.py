@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.11.0",
+    version="1.12.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -626,13 +626,17 @@ def create_checkpoint(
     """Capture a consumer checkpoint at the current published-stream position.
 
     The position (number of published readings and the last reading's
-    deterministic-order keyset) and the session's published watermark are
-    recorded together in one serialised write transaction, i.e. one read
-    snapshot.  Checkpoint names are unique within a session: re-creating the
-    same name at the same position is idempotent (200, the original snapshot is
-    returned unchanged); creating it once the stream has moved to a different
-    position returns 409.  Later publishes and session closure never mutate a
-    checkpoint.
+    deterministic-order keyset), the session's monotonic publish marker and
+    the published watermark are recorded together in one serialised write
+    transaction, i.e. one read snapshot.  Checkpoint names are unique within
+    a session: re-creating the same name while the publish marker is
+    unchanged is idempotent (200, the original snapshot including
+    ``created_at`` is returned unchanged); creating it once the marker has
+    advanced (new readings published) returns 409.  The marker advances only
+    with actual publishes and is not moved by retention, so the decision is
+    unaffected by later cleanup -- even when the rows published since
+    capture are themselves removed.  Later publishes and session closure
+    never mutate a checkpoint.
     """
     result, created = checkpoints.create_checkpoint(conn, session_id, body.name)
     return JSONResponse(

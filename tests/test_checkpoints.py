@@ -17,6 +17,7 @@ def client(tmp_path, monkeypatch):
     main.app.state.db_path = db_path
     database.init_db(db_path)
     with TestClient(main.app) as c:
+        c.db_path = db_path  # type: ignore[attr-defined]
         yield c
 
 
@@ -48,6 +49,13 @@ def seal(client, sid, source, final_observed_at):
 
 def make_checkpoint(client, sid, name):
     return client.post(f"/sessions/{sid}/checkpoints", json={"name": name})
+
+
+def retention(client, sid, cutoff, dry_run=None):
+    body = {"cutoff": cutoff}
+    if dry_run is not None:
+        body["dry_run"] = dry_run
+    return client.post(f"/sessions/{sid}/retention", json=body)
 
 
 def keys(rows):
@@ -534,6 +542,163 @@ class TestCheckpointConcurrency:
         assert [c["name"] for c in listed] == ["cp"]
 
 
+class TestIdempotencyAgainstRetention:
+    """Same-name retry idempotency is keyed on the persistent publish marker.
+
+    Retention legitimately deletes the published rows a checkpoint already
+    covered, so the live position (row count + last keyset) shrinks even
+    though nothing new was ever published.  Retry idempotency must not be
+    derived from that live position: an unchanged publish marker means an
+    unchanged checkpoint, an advanced marker means 409 -- whether or not the
+    rows published since capture are still present.
+    """
+
+    def test_same_name_retry_idempotent_after_covered_rows_cleaned(self, client):
+        sid = create_session(client, lateness=0.0)
+        publish_ladder(client, sid)  # 4 published: a@:00, b@:10, a@:20, b@:30
+        first = make_checkpoint(client, sid, "cp")
+        assert first.status_code == 201
+        assert first.json()["stream_offset"] == 4
+        assert first.json()["publish_marker"] == 4
+
+        # The checkpoint is the only one, boundary b@:30: every published row
+        # is at or before its captured keyset and therefore deletable.
+        cleanup = retention(client, sid, "2026-12-31T00:00:00Z", False)
+        assert cleanup.status_code == 200, cleanup.text
+        assert cleanup.json()["deleted"] == 4
+        # the buffered boundary reading (a@:40) is not a candidate; the live
+        # published stream is now empty
+        assert full_stream(client, sid) == []
+
+        # The reported bug: the live stream position is now (0, null...) and
+        # differs from the frozen snapshot, so the position-based check
+        # returned 409.  No new reading has been published -- it must stay
+        # idempotent, returning the original snapshot verbatim.
+        second = make_checkpoint(client, sid, "cp")
+        assert second.status_code == 200, second.text
+        assert second.json() == first.json()
+        assert second.json()["stream_offset"] == 4
+        assert second.json()["last_seq"] == 2
+        # a second cleanup round in between changes nothing either
+        retention(client, sid, "2026-12-31T00:00:00Z", False)
+        third = make_checkpoint(client, sid, "cp")
+        assert third.status_code == 200
+        assert third.json() == first.json()
+
+    def test_409_once_a_new_reading_published_even_if_it_is_removed(self, client):
+        sid = create_session(client, lateness=0.0)
+        publish_ladder(client, sid)  # 4 published: a@:00..b@:30; a@:40 buffered
+        first = make_checkpoint(client, sid, "cp")
+        assert first.json()["publish_marker"] == 4
+
+        # Retention wipes every row the checkpoint already covered (all 4).
+        assert retention(
+            client, sid, "2026-12-31T00:00:00Z", False).json()["deleted"] == 4
+        assert make_checkpoint(client, sid, "cp").status_code == 200
+
+        # A genuinely new publish: the buffered a@:40 drains when the slowest
+        # clock moves past it.  The marker must advance even when the new rows
+        # later disappear.  The retention API would normally protect a row
+        # published after a checkpoint (its keyset is past the boundary), so
+        # the disappearance is modelled directly -- the idempotency guarantee
+        # must hold regardless of how the rows went missing.
+        report(client, sid, [
+            {"source_id": "a", "seq": 5, "observed_at": "2026-01-01T00:01:00Z",
+             "value": 7},
+        ])  # slowest a@:01:00 -> wm :01:00 -> a@:40 publishes
+        assert keys(full_stream(client, sid)) == [("a", 3)]
+
+        conn = sqlite3.connect(client.db_path)
+        try:
+            marker = conn.execute(
+                "SELECT publish_marker FROM sessions WHERE session_id = ?",
+                (sid,),
+            ).fetchone()[0]
+            conn.execute(
+                "DELETE FROM readings WHERE session_id = ? AND status = 'published'",
+                (sid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert marker == 5
+        assert full_stream(client, sid) == []
+
+        r = make_checkpoint(client, sid, "cp")
+        assert r.status_code == 409, r.text
+        assert "publish_marker" in r.json()["detail"]
+        # the original checkpoint, including its original created_at, survives
+        listed = client.get(f"/sessions/{sid}/checkpoints").json()["checkpoints"]
+        assert len(listed) == 1
+        assert listed[0] == first.json()
+
+    def test_quarantine_and_watermark_only_moves_do_not_advance_marker(self, client):
+        sid = create_session(client, lateness=10.0)
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": "2026-01-01T00:00:20Z"},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:30Z"},
+        ])  # wm :10; nothing published yet
+        first = make_checkpoint(client, sid, "cp")
+        assert first.json()["publish_marker"] == 0
+
+        # watermark advances while the only buffered reading sits on the
+        # boundary: no publish, so the marker is unchanged -> idempotent
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:40Z"}])
+        assert client.get(f"/sessions/{sid}").json()["published_watermark"] == \
+            "2026-01-01T00:00:20Z"
+        assert make_checkpoint(client, sid, "cp").status_code == 200
+
+        # late readings quarantine instead of publishing: still unchanged
+        late = report(client, sid, [
+            {"source_id": "a", "seq": 9, "observed_at": "2026-01-01T00:00:01Z",
+             "value": 9}])
+        assert late.json()["quarantined"] == 1
+        r = make_checkpoint(client, sid, "cp")
+        assert r.status_code == 200
+        assert r.json() == first.json()
+
+    def test_marker_advances_through_tail_flush_on_session_close(self, client):
+        sid = create_session(client, lateness=10.0)
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": "2026-01-01T00:00:11Z"},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:40Z"},
+        ])
+        first = make_checkpoint(client, sid, "cp")
+        marker_before = first.json()["publish_marker"]
+        # the last-source seal tail-publishes inside the seal transaction;
+        # the marker must advance in that same transaction
+        seal(client, sid, "a", "2026-01-01T00:00:25Z")
+        seal(client, sid, "b", "2026-01-01T00:00:40Z")
+        assert client.get(f"/sessions/{sid}").json()["closed"] is True
+
+        conn = sqlite3.connect(client.db_path)
+        try:
+            marker_after = conn.execute(
+                "SELECT publish_marker FROM sessions WHERE session_id = ?",
+                (sid,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert marker_after > marker_before
+        assert make_checkpoint(client, sid, "cp").status_code == 409
+
+    def test_marker_is_not_moved_by_retention(self, client):
+        sid = create_session(client, lateness=0.0)
+        publish_ladder(client, sid)
+        make_checkpoint(client, sid, "cp")
+        retention(client, sid, "2026-12-31T00:00:00Z", False)
+        conn = sqlite3.connect(client.db_path)
+        try:
+            marker = conn.execute(
+                "SELECT publish_marker FROM sessions WHERE session_id = ?",
+                (sid,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert marker == 4
+
+
 class TestCheckpointMigration:
     def test_v3_applies_to_legacy_database(self, tmp_path, monkeypatch):
         from app import database
@@ -559,7 +724,7 @@ class TestCheckpointMigration:
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2, 3, 4]
+            assert versions == [1, 2, 3, 4, 5]
             names = {
                 r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")
@@ -569,8 +734,13 @@ class TestCheckpointMigration:
             assert cols == {
                 "session_id", "name", "created_at", "stream_offset",
                 "last_observed_at", "last_source_id", "last_seq",
-                "published_watermark",
+                "publish_marker", "published_watermark",
             }
+            # The v5 monotonic publish marker lands on sessions too.
+            session_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(sessions)")
+            }
+            assert "publish_marker" in session_cols
         finally:
             conn.close()
 
@@ -596,3 +766,156 @@ class TestCheckpointMigration:
             assert c.get(
                 "/sessions/legacy-s/checkpoints/cp/stream"
             ).status_code == 200
+
+    def test_v5_baseline_preserves_checkpoints_and_resume_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        """Upgrading a v4 database keeps checkpoints and resume keysets.
+
+        Checkpoint rows survive untouched except for the shared baseline
+        marker; resume still starts strictly after the frozen keyset.  A
+        same-name retry before any post-upgrade publish is idempotent; once a
+        reading is published afterwards it conflicts -- even after the rows
+        are removed again.
+        """
+        from app import database, main
+        from app.database import utc_now
+        from app.time_utils import store_event_time
+
+        db_path = str(tmp_path / "legacy-v4.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(database.SCHEMA_V0)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            now = store_event_time(utc_now())
+            for version in (1, 2, 3, 4):
+                database.MIGRATIONS[version](conn, now)
+            # One live session with two published readings and a checkpoint
+            # captured after the second one -- the v4-era shape.
+            conn.execute(
+                "INSERT INTO sessions (session_id, source_ids,"
+                " allowed_lateness_seconds, published_watermark, created_at)"
+                " VALUES (?, ?, 0, ?, ?)",
+                ("legacy-s", '["a","b"]',
+                 "2026-01-01T00:00:20Z", now),
+            )
+            # v2-era per-source rows (no reports recorded in this fixture;
+            # the two readings below were published under a prior release).
+            conn.executemany(
+                "INSERT INTO session_sources (session_id, source_id,"
+                " max_observed_at, first_seen_at, final_observed_at, sealed_at)"
+                " VALUES (?, ?, NULL, ?, NULL, NULL)",
+                [("legacy-s", "a", now), ("legacy-s", "b", now)],
+            )
+            for sid_, seq, ts, wm in (
+                ("a", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:10Z"),
+                ("b", 1, "2026-01-01T00:00:10Z", "2026-01-01T00:00:20Z"),
+            ):
+                conn.execute(
+                    "INSERT INTO readings (session_id, source_id, seq,"
+                    " observed_at, payload, status, first_received_at,"
+                    " published_watermark, quarantined_watermark)"
+                    " VALUES (?, ?, ?, ?, '1', 'published', ?, ?, NULL)",
+                    ("legacy-s", sid_, seq, ts, now, wm),
+                )
+            conn.execute(
+                "INSERT INTO checkpoints (session_id, name, created_at,"
+                " stream_offset, last_observed_at, last_source_id, last_seq,"
+                " published_watermark) VALUES (?, ?, ?, 2, ?, 'b', 1, ?)",
+                ("legacy-s", "cp", now, "2026-01-01T00:00:10Z",
+                 "2026-01-01T00:00:20Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        database.init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            assert [r[0] for r in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version")] == \
+                [1, 2, 3, 4, 5]
+            # shared baseline = extant published count (2)
+            assert conn.execute(
+                "SELECT publish_marker FROM sessions WHERE session_id ="
+                " 'legacy-s'").fetchone()[0] == 2
+            cp = conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id = 'legacy-s'"
+                " AND name = 'cp'").fetchone()
+            assert cp["publish_marker"] == 2
+            # resume boundary (the frozen keyset) and created_at survive
+            assert cp["last_observed_at"] == "2026-01-01T00:00:10Z"
+            assert cp["created_at"] == now
+            assert cp["stream_offset"] == 2
+        finally:
+            conn.close()
+
+        # Re-running init must not re-apply v5.
+        database.init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 5"
+            ).fetchone()[0] == 1
+        finally:
+            conn.close()
+
+        monkeypatch.setenv("SENSOR_DB_PATH", db_path)
+        main.app.state.db_path = db_path
+        with TestClient(main.app) as c:
+            c.db_path = db_path  # type: ignore[attr-defined]
+            # no publish since the baseline: same-name retry is idempotent...
+            r = c.post("/sessions/legacy-s/checkpoints", json={"name": "cp"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["publish_marker"] == 2
+            assert body["created_at"]
+            # ...and the resume boundary is intact (nothing after b@:10 yet)
+            page = c.get(
+                "/sessions/legacy-s/checkpoints/cp/stream").json()
+            assert page["readings"] == []
+
+            # publish one more reading (drain the ladder cadence): the first
+            # clock push only buffers (strict-less-than boundary), the second
+            # publishes a@:30 and advances the marker past the checkpoint.
+            posted = c.post(
+                "/sessions/legacy-s/readings",
+                json={"readings": [
+                    {"source_id": "a", "seq": 2,
+                     "observed_at": "2026-01-01T00:00:30Z", "value": 3},
+                    {"source_id": "b", "seq": 2,
+                     "observed_at": "2026-01-01T00:00:40Z", "value": 4},
+                ]},
+            )
+            assert posted.status_code == 200, posted.text
+            assert posted.json()["published_now"] == 0
+            pushed = c.post(
+                "/sessions/legacy-s/readings",
+                json={"readings": [
+                    {"source_id": "a", "seq": 3,
+                     "observed_at": "2026-01-01T00:00:50Z", "value": 5},
+                ]},
+            )
+            assert pushed.status_code == 200, pushed.text
+            assert pushed.json()["published_now"] == 1
+            assert c.post(
+                "/sessions/legacy-s/checkpoints", json={"name": "cp"}
+            ).status_code == 409
+
+            # even after the newly published row is removed, it stays 409:
+            # the marker, not the live rows, is the authority
+            conn2 = sqlite3.connect(db_path)
+            try:
+                conn2.execute(
+                    "DELETE FROM readings WHERE session_id = 'legacy-s'"
+                    " AND status = 'published'")
+                conn2.commit()
+            finally:
+                conn2.close()
+            assert c.post(
+                "/sessions/legacy-s/checkpoints", json={"name": "cp"}
+            ).status_code == 409
